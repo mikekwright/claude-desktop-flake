@@ -1,0 +1,87 @@
+name: Update Claude Desktop
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-claude-desktop
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = true
+            extra-substituters = https://cache.numtide.com
+            extra-trusted-public-keys = niks3.numtide.com-1:DTx8wZduET09hRmMtKdQDxNNthLQETkc/yaX7M4qK0g=
+
+      - name: Record current version
+        id: before
+        run: echo "version=$(nix eval --raw .#claude-desktop.version)" >> "$GITHUB_OUTPUT"
+
+      - name: Update llm-agents input
+        run: nix flake update llm-agents
+
+      - name: Record new version
+        id: after
+        run: |
+          echo "version=$(nix eval --raw .#claude-desktop.version)" >> "$GITHUB_OUTPUT"
+          echo "rev=$(jq -r '.nodes["llm-agents"].locked.rev' flake.lock)" >> "$GITHUB_OUTPUT"
+          if git diff --quiet -- flake.lock; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build package
+        if: steps.after.outputs.changed == 'true'
+        run: nix build --print-build-logs .#claude-desktop
+
+      - name: Commit lock file
+        if: steps.after.outputs.changed == 'true'
+        env:
+          BEFORE: ${{ steps.before.outputs.version }}
+          AFTER: ${{ steps.after.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add flake.lock
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git commit -m "claude-desktop: $BEFORE -> $AFTER"
+          else
+            git commit -m "flake.lock: update llm-agents input"
+          fi
+          git push origin HEAD:main
+
+      - name: Tag and release
+        if: steps.after.outputs.changed == 'true' && steps.before.outputs.version != steps.after.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.after.outputs.version }}
+          LLM_AGENTS_REV: ${{ steps.after.outputs.rev }}
+        run: |
+          tag="v$VERSION"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "Tag $tag already exists, skipping release"
+            exit 0
+          fi
+          git tag -a "$tag" -m "Claude Desktop $VERSION"
+          git push origin "$tag"
+          gh release create "$tag" \
+            --title "Claude Desktop $VERSION" \
+            --notes "Claude Desktop $VERSION, packaged from numtide/llm-agents.nix at https://github.com/numtide/llm-agents.nix/commit/$LLM_AGENTS_REV"
